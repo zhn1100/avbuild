@@ -75,6 +75,7 @@ DUP_OBJS=(libswscale/log2_tab.o libswresample/log2_tab.o libavcodec/log2_tab.o l
   libswscale/vulkan/vulkan_shaderc.o
   libswscale/framepool.o
   libswscale/aarch64/ops_asmgen.o # for host exe
+  libswscale/aarch64/ops_static.o # for host exe
   libswscale/x86/emms.o
   libswresample/swresampleres.o
   libpostproc/postprocres.o
