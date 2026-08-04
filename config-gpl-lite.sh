@@ -17,7 +17,7 @@ ENC_OPT_MOBILE="--enable-encoder=libx26*,aac,cfhd,dnxhd,exr,ff*,flv,*yuv*,gif,h2
 MUX_OPT_MOBILE="--enable-muxer=mjpeg,dnxhd,fifo,flv,gif,hls,h264,hevc,image2,mov,mp4,mpegts,matroska,null,og*,pcm*,rawvideo,rt*,spdif,*pipe,*segment,webm,wav"
 PROT_OPT_MOBILE="--enable-protocol=cache,concat*,crypto*,data,fd,*file,ftp,h*,i*,pipe,rt*,s*,t*,u*"
 FILTER_OPT_MOBILE="--enable-filter=drawtext,*null*,afade,*fifo,*format,*resample,aeval,atempo,pan,crop,eq*,framerate,hw*,loudnorm,scale*,volume,yadif*,*movie,overlay,*_vulkan,_*vaapi,*_qsv,*_d3d*,*_vt"
-PROT_OPT="${PROT_OPT_MOBILE}"
+PROT_OPT="${PROT_OPT_MOBILE},libcurl"
 DEC_OPT="${DEC_OPT_MOBILE},rv*,ffv*"
 DEMUX_OPT="${DEMUX_OPT_MOBILE},mlv,nsv,nut"
 ENC_OPT="${ENC_OPT_MOBILE},*nvenc,*qsv,*v4l2m2m,*vaapi"
