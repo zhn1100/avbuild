@@ -3,20 +3,26 @@ From: wang-bin <wbsecg1@gmail.com>
 Date: Sun, 29 Sep 2024 15:59:13 +0800
 Subject: [PATCH 30/38] hls: support segments pretend to be gif & png
 
-Fix: detect the png/gif signature directly instead of relying on
-av_probe_input_format2() + a subsequent av_probe_input_buffer():
-the latter still loses to extension-based image demuxers (the segment
-gets detected as an image, not as mpegts). When a png/gif signature is
-found, force the mpegts demuxer and skip the image magic bytes; the
-mpegts demuxer resyncs to the real TS packet boundary.
+Detect png/gif magic at the start of the first segment and, when found,
+select the mpegts demuxer directly. The HLS layer only decides *which*
+demuxer to use; locating the real TS packet boundary is left to the
+mpegts demuxer (0x47 + 188-byte alignment resync), so no bytes are
+skipped and no offset is assumed.
 
-Also make sure the forced path does not carry a stale error from a
-previously parsed playlist variant (set ret = 0).
+Relying on av_probe_input_format2() to find png_pipe/gif_pipe is
+unreliable: the demuxers may not be compiled in (e.g. Android), and the
+subsequent av_probe_input_buffer() would still lose to extension-based
+image demuxers (e.g. .webp URLs), misdetecting the segment as an image.
 
-Verified with ezdmw HLS (.webp playlist + png-pretending TS segments,
-471-byte PNG header + 184-byte site metadata, real TS at offset 655):
-upstream code resolves the segment as `png`, this version resolves
-h264 1920x1080 + aac.
+If the mpegts demuxer is not available in the build, fall back to the
+original generic probe. All probe/seek return values are checked; a
+failed seek back to offset 0 aborts with an error instead of probing at
+an unknown position.
+
+Verified with ezdmw HLS (.webp playlist, png-pretending segments,
+471-byte PNG header + 184-byte metadata, real TS at offset 655):
+generic probe resolves the segment as `png`, this version resolves
+h264 1920x1080 + aac. seg_allow_img=1 restores the original behavior.
 ---
 diff --git a/libavformat/hls.c b/libavformat/hls.c
 index 0b01f406f6..73eddf7c12 100644
@@ -30,49 +36,55 @@ index 0b01f406f6..73eddf7c12 100644
      char *allowed_extensions;
      char *allowed_segment_extensions;
      int extension_picky;
-@@ -2186,7 +2187,36 @@ static int hls_read_header(AVFormatContext *s)
+@@ -2186,7 +2187,42 @@ static int hls_read_header(AVFormatContext *s)
              pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
              pls->ctx->interrupt_callback = s->interrupt_callback;
              url = av_strdup(pls->segments[0]->url);
 -            ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
-+            unsigned skip = 0;
-+            const AVInputFormat *forced_fmt = NULL;
-+            if (!c->seg_allow_img) {
-+                uint8_t b[10] = { 0 }; /* probe at most 10 */
-+                avio_read(&pls->pb.pub, b, sizeof(b));
-+                avio_seek(&pls->pb.pub, 0, SEEK_SET);
-+                /* Check the image signatures directly. Relying on
-+                 * av_probe_input_format2() to find png_pipe/gif_pipe is
-+                 * unreliable (the demuxer may not be compiled in, and the
-+                 * later av_probe_input_buffer() would still lose to
-+                 * extension-based image demuxers, e.g. .webp URLs). */
-+                if (!memcmp(b, "\x89PNG\r\n\x1a\n", 8)) {
-+                    skip = 3; /* skip until ts sync byte 'G'(0x47) */
-+                    forced_fmt = av_find_input_format("mpegts");
-+                    av_log(s, AV_LOG_INFO, "segments pretend to be png\n");
-+                } else if (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6)) {
-+                    skip = 10;
-+                    forced_fmt = av_find_input_format("mpegts");
-+                    av_log(s, AV_LOG_INFO, "segments pretend to be gif\n");
++            /* Peek at the beginning of the first segment to detect
++             * png/gif-magic-pretending segments, then always restore the
++             * read position. The HLS layer only decides *which* demuxer to
++             * use; finding the real TS packet boundary is the mpegts
++             * demuxer's own job (it resyncs on 0x47 + 188 alignment). Relying
++             * on av_probe_input_format2() to find png_pipe/gif_pipe instead
++             * is unreliable: the demuxers may not be compiled in, and the
++             * subsequent av_probe_input_buffer() would still lose to
++             * extension-based image demuxers (e.g. .webp URLs). */
++            {
++                uint8_t b[10] = { 0 };
++                int n = avio_read(&pls->pb.pub, b, sizeof(b));
++                if ((ret = avio_seek(&pls->pb.pub, 0, SEEK_SET)) < 0) {
++                    av_log(s, AV_LOG_ERROR, "Failed to restore segment read position after signature check: %s\n",
++                           av_err2str(ret));
++                    avformat_free_context(pls->ctx);
++                    pls->ctx = NULL;
++                    av_free(url);
++                    return ret;
 +                }
-+            }
-+            if (forced_fmt) {
-+                /* the segment pretends to be an image: force mpegts directly,
-+                 * generic probing would lose to image demuxers */
-+                in_fmt = forced_fmt;
-+                ret = 0; /* do not carry a stale error from a previous playlist variant */
-+                avio_seek(&pls->pb.pub, skip, SEEK_SET);
-+            } else {
-+                ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, skip, 0);
++                if (!c->seg_allow_img &&
++                    ((n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) ||
++                     (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6))))) {
++                    in_fmt = av_find_input_format("mpegts");
++                    if (in_fmt) {
++                        ret = 0; /* do not carry a stale error from a previous playlist variant */
++                        av_log(s, AV_LOG_INFO, "Segment starts with png/gif magic, using mpegts demuxer\n");
++                    } else {
++                        /* mpegts demuxer not available in this build: fall back to the
++                         * original generic probe instead of inventing a new error path */
++                        ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
++                    }
++                } else {
++                    ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
++                }
 +            }
  
              for (int n = 0; n < pls->n_segments; n++)
                  if (ret >= 0)
-@@ -2683,6 +2713,8 @@ static const AVOption hls_options[] = {
+@@ -2683,6 +2719,8 @@ static const AVOption hls_options[] = {
          OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
      {"seg_max_retry", "Maximum number of times to reload a segment on error.",
       OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
-+    {"seg_allow_img", "Allow segments detected as gif and png images, 0 = disable, 1 = enable",
++    {"seg_allow_img", "Treat PNG/GIF-signature HLS segments as MPEG-TS (0, default); 1 = allow them to participate in generic image probing",
 +        OFFSET(seg_allow_img), AV_OPT_TYPE_BOOL, { .i64 = 0}, 0, 1, FLAGS},
      {NULL}
  };
