@@ -7,9 +7,9 @@ When the first segment starts with png/gif magic, re-run the generic
 probe with (a) an offset (3 for png, 10 for gif) that breaks the image
 signature and (b) a NULL filename so that image demuxers can no longer
 win via the URL extension (e.g. .webp). The probe then decides the real
-format from the payload (mpegts via 0x47 + 188 alignment). The HLS layer
-never asserts the format itself, so png/gif-looking garbage fails the
-probe at header time instead of being forced into mpegts.
+format from the payload (e.g. mpegts via 0x47 + 188 alignment). The HLS
+layer never asserts the format itself, so png/gif-looking garbage fails
+the probe at header time instead of being forced into mpegts.
 
 Relying on av_probe_input_format2() to find png_pipe/gif_pipe is
 unreliable: the demuxers may not be compiled in (e.g. Android), and the
@@ -98,7 +98,7 @@ index 0b01f406f6..73eddf7c12 100644
          OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
      {"seg_max_retry", "Maximum number of times to reload a segment on error.",
       OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
-+    {"seg_allow_img", "Treat PNG/GIF-signature HLS segments as MPEG-TS (0, default); 1 = allow them to participate in generic image probing",
++    {"seg_allow_img", "Allow PNG/GIF-signature HLS segments to participate in normal image probing; 0 = probe past image disguise, 1 = normal probing",
 +        OFFSET(seg_allow_img), AV_OPT_TYPE_BOOL, { .i64 = 0}, 0, 1, FLAGS},
      {NULL}
  };
