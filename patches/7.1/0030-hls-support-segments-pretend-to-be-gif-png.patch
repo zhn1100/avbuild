@@ -7,15 +7,19 @@ Fix: detect the png/gif signature directly instead of relying on
 av_probe_input_format2() + a subsequent av_probe_input_buffer():
 the latter still loses to extension-based image demuxers (the segment
 gets detected as an image, not as mpegts). When a png/gif signature is
-found, force the mpegts demuxer and skip the image header.
+found, force the mpegts demuxer and skip the image magic bytes; the
+mpegts demuxer resyncs to the real TS packet boundary.
 
-Verified with ezdmw HLS (.webp playlist + png-pretending TS segments):
+Also make sure the forced path does not carry a stale error from a
+previously parsed playlist variant (set ret = 0).
+
+Verified with ezdmw HLS (.webp playlist + png-pretending TS segments,
+471-byte PNG header + 184-byte site metadata, real TS at offset 655):
 upstream code resolves the segment as `png`, this version resolves
-h264 + aac.
+h264 1920x1080 + aac.
 ---
-
 diff --git a/libavformat/hls.c b/libavformat/hls.c
-index 900e96c..4e8cb28 100644
+index 0b01f406f6..73eddf7c12 100644
 --- a/libavformat/hls.c
 +++ b/libavformat/hls.c
 @@ -222,6 +222,7 @@ typedef struct HLSContext {
@@ -26,7 +30,7 @@ index 900e96c..4e8cb28 100644
      char *allowed_extensions;
      char *allowed_segment_extensions;
      int extension_picky;
-@@ -2186,7 +2187,35 @@ static int hls_read_header(AVFormatContext *s)
+@@ -2186,7 +2187,36 @@ static int hls_read_header(AVFormatContext *s)
              pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
              pls->ctx->interrupt_callback = s->interrupt_callback;
              url = av_strdup(pls->segments[0]->url);
@@ -56,6 +60,7 @@ index 900e96c..4e8cb28 100644
 +                /* the segment pretends to be an image: force mpegts directly,
 +                 * generic probing would lose to image demuxers */
 +                in_fmt = forced_fmt;
++                ret = 0; /* do not carry a stale error from a previous playlist variant */
 +                avio_seek(&pls->pb.pub, skip, SEEK_SET);
 +            } else {
 +                ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, skip, 0);
@@ -63,7 +68,7 @@ index 900e96c..4e8cb28 100644
  
              for (int n = 0; n < pls->n_segments; n++)
                  if (ret >= 0)
-@@ -2683,6 +2712,8 @@ static const AVOption hls_options[] = {
+@@ -2683,6 +2713,8 @@ static const AVOption hls_options[] = {
          OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
      {"seg_max_retry", "Maximum number of times to reload a segment on error.",
       OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
