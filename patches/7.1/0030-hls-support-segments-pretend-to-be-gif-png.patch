@@ -3,26 +3,26 @@ From: wang-bin <wbsecg1@gmail.com>
 Date: Sun, 29 Sep 2024 15:59:13 +0800
 Subject: [PATCH 30/38] hls: support segments pretend to be gif & png
 
-Detect png/gif magic at the start of the first segment and, when found,
-select the mpegts demuxer directly. The HLS layer only decides *which*
-demuxer to use; locating the real TS packet boundary is left to the
-mpegts demuxer (0x47 + 188-byte alignment resync), so no bytes are
-skipped and no offset is assumed.
+When the first segment starts with png/gif magic, re-run the generic
+probe with (a) an offset (3 for png, 10 for gif) that breaks the image
+signature and (b) a NULL filename so that image demuxers can no longer
+win via the URL extension (e.g. .webp). The probe then decides the real
+format from the payload (mpegts via 0x47 + 188 alignment). The HLS layer
+never asserts the format itself, so png/gif-looking garbage fails the
+probe at header time instead of being forced into mpegts.
 
 Relying on av_probe_input_format2() to find png_pipe/gif_pipe is
 unreliable: the demuxers may not be compiled in (e.g. Android), and the
-subsequent av_probe_input_buffer() would still lose to extension-based
-image demuxers (e.g. .webp URLs), misdetecting the segment as an image.
-
-If the mpegts demuxer is not available in the build, fall back to the
-original generic probe. All probe/seek return values are checked; a
-failed seek back to offset 0 aborts with an error instead of probing at
-an unknown position.
+later av_probe_input_buffer() would still lose to extension-based image
+demuxers. Non-EOF avio_read errors are propagated like
+av_probe_input_buffer2() does instead of degrading into a second probe;
+a failed seek back to offset 0 aborts with the AVIO error.
 
 Verified with ezdmw HLS (.webp playlist, png-pretending segments,
 471-byte PNG header + 184-byte metadata, real TS at offset 655):
-generic probe resolves the segment as `png`, this version resolves
-h264 1920x1080 + aac. seg_allow_img=1 restores the original behavior.
+resolves h264 1920x1080 + aac. Standard TS/fMP4 HLS unchanged, real
+image segments fail under the default policy and work with
+seg_allow_img=1, malformed inputs fail fast at header time.
 ---
 diff --git a/libavformat/hls.c b/libavformat/hls.c
 index 0b01f406f6..73eddf7c12 100644
@@ -36,23 +36,40 @@ index 0b01f406f6..73eddf7c12 100644
      char *allowed_extensions;
      char *allowed_segment_extensions;
      int extension_picky;
-@@ -2186,7 +2187,42 @@ static int hls_read_header(AVFormatContext *s)
+@@ -2186,7 +2187,56 @@ static int hls_read_header(AVFormatContext *s)
              pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
              pls->ctx->interrupt_callback = s->interrupt_callback;
              url = av_strdup(pls->segments[0]->url);
 -            ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
 +            /* Peek at the beginning of the first segment to detect
 +             * png/gif-magic-pretending segments, then always restore the
-+             * read position. The HLS layer only decides *which* demuxer to
-+             * use; finding the real TS packet boundary is the mpegts
-+             * demuxer's own job (it resyncs on 0x47 + 188 alignment). Relying
-+             * on av_probe_input_format2() to find png_pipe/gif_pipe instead
-+             * is unreliable: the demuxers may not be compiled in, and the
-+             * subsequent av_probe_input_buffer() would still lose to
-+             * extension-based image demuxers (e.g. .webp URLs). */
++             * read position. When a fake image magic is found we do not
++             * assert the format ourselves: the generic probe is re-run with
++             * (a) an offset that breaks the image signature and (b) a NULL
++             * filename so that the .webp-style URL extension can no longer
++             * boost image demuxer scores. The probe then decides from the
++             * actual payload (e.g. mpegts via 0x47 + 188 alignment). This
++             * keeps the HLS layer free of format assumptions: malformed
++             * png/gif-looking garbage simply fails the probe at header time
++             * instead of being forced into mpegts. */
 +            {
 +                uint8_t b[10] = { 0 };
++                unsigned probe_offset = 0;
++                const char *probe_url = url;
 +                int n = avio_read(&pls->pb.pub, b, sizeof(b));
++                if (n < 0 && n != AVERROR_EOF) {
++                    /* propagate real I/O errors like av_probe_input_buffer2()
++                     * does, instead of degrading them into a second probe */
++                    ret = n;
++                    av_log(s, AV_LOG_ERROR, "Failed to read segment header for probing: %s\n",
++                           av_err2str(ret));
++                    avformat_free_context(pls->ctx);
++                    pls->ctx = NULL;
++                    av_free(url);
++                    return ret;
++                }
++                if (n == AVERROR_EOF)
++                    n = 0;
 +                if ((ret = avio_seek(&pls->pb.pub, 0, SEEK_SET)) < 0) {
 +                    av_log(s, AV_LOG_ERROR, "Failed to restore segment read position after signature check: %s\n",
 +                           av_err2str(ret));
@@ -61,26 +78,23 @@ index 0b01f406f6..73eddf7c12 100644
 +                    av_free(url);
 +                    return ret;
 +                }
-+                if (!c->seg_allow_img &&
-+                    ((n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) ||
-+                     (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6))))) {
-+                    in_fmt = av_find_input_format("mpegts");
-+                    if (in_fmt) {
-+                        ret = 0; /* do not carry a stale error from a previous playlist variant */
-+                        av_log(s, AV_LOG_INFO, "Segment starts with png/gif magic, using mpegts demuxer\n");
-+                    } else {
-+                        /* mpegts demuxer not available in this build: fall back to the
-+                         * original generic probe instead of inventing a new error path */
-+                        ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
++                if (!c->seg_allow_img) {
++                    if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) {
++                        probe_offset = 3;  /* break the png signature for the probe */
++                        probe_url = NULL;  /* drop misleading extension scores */
++                        av_log(s, AV_LOG_INFO, "Segment starts with png magic, probing without filename at offset %u\n", probe_offset);
++                    } else if (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6))) {
++                        probe_offset = 10; /* break the gif signature for the probe */
++                        probe_url = NULL;
++                        av_log(s, AV_LOG_INFO, "Segment starts with gif magic, probing without filename at offset %u\n", probe_offset);
 +                    }
-+                } else {
-+                    ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
 +                }
++                ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, probe_url, NULL, probe_offset, 0);
 +            }
  
              for (int n = 0; n < pls->n_segments; n++)
                  if (ret >= 0)
-@@ -2683,6 +2719,8 @@ static const AVOption hls_options[] = {
+@@ -2683,6 +2733,8 @@ static const AVOption hls_options[] = {
          OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
      {"seg_max_retry", "Maximum number of times to reload a segment on error.",
       OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
